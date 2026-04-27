@@ -8,7 +8,7 @@ analysis, and persists everything to Snowflake.
 
 | Step | What | How |
 |------|------|-----|
-| 1. Capture | USB webcam photo (1920x1080 MJPEG) | picamera2 `/dev/video0` |
+| 1. Capture | USB webcam photo (1920x1080 MJPEG) | fswebcam `/dev/video0` |
 | 2. Sensor | Temperature, pressure, altitude | BMP280 via I2C (smbus2) |
 | 3. QR Scan | Decode barcodes and QR codes | pyzbar + libzbar0 |
 | 3b. Upload | PUT image to Snowflake internal stage | SNOWFLAKE_SSE encryption |
