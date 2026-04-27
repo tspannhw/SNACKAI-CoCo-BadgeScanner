@@ -1,0 +1,16 @@
+{
+  "image": {
+    "file": "photo.jpg",
+    "size_kb": 259.1,
+    "dimensions": "640x480",
+    "qr_codes": []
+  },
+  "prompt": "You are analysing a scanned conference badge image. Describe what you see in the image. Additional extracted data:\nImage file: photo.jpg (259.1 KB)\nDimensions: 640x480\n\nProvide a brief summary of what this badge contains. If QR code data is present, describe what it likely links to.",
+  "llm": {
+    "response": "ids.com/id/2591",
+    "model": "moondream",
+    "tokens": 9,
+    "duration_s": 68.9
+  },
+  "timestamp": "2026-04-27T12:49:12"
+}
