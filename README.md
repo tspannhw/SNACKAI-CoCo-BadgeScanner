@@ -4,6 +4,154 @@ End-to-end CLI pipeline running on a Raspberry Pi 5 that captures conference
 badge images, reads environmental sensor data, performs cloud and edge AI
 analysis, and persists everything to Snowflake.
 
+## Example Run
+
+````
+
+root@rp500:/opt/demo/badgescanner# python badge_scanner.py 
+[0:35:02.955272010] [3678]  INFO Camera camera_manager.cpp:340 libcamera v0.7.0+rpt20260205
+[0:35:02.964385042] [3684]  INFO Camera camera_manager.cpp:223 Adding camera '/base/axi/pcie@1000120000/rp1/usb@200000-1:1.0-046d:0892' for pipeline handler uvcvideo
+
+============================================================
+  SNOWFLAKE SUMMIT BADGE SCANNER
+  2026-04-28 17:21:28
+  Camera: HD Pro Webcam C920 (index 0)
+============================================================
+
+============================================================
+  STEP 1: Capturing Image from Webcam
+============================================================
+  Camera: HD Pro Webcam C920 (index 0)
+[0:35:02.976835429] [3678]  INFO Camera camera.cpp:1215 configuring streams: (0) 1920x1080-MJPEG/Rec709/Rec709/Rec601/Limited
+[0:35:03.629797279] [3684]  INFO V4L2 v4l2_videodevice.cpp:1913 /dev/video0[10:cap]: Zero sequence expected for first frame (got 1)
+  Captured image: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+  Resolution: 2304x1536
+  Size: 176.1 KB
+  Local path: /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+
+============================================================
+  STEP 2: Reading BMP280 Sensor
+============================================================
+  Temperature : 25.5 C / 77.8 F
+  Pressure    : 1006.6 hPa
+  Est Altitude: 181 ft
+
+============================================================
+  STEP 3: Scanning QR Codes & Barcodes
+============================================================
+  Found 1 code(s):
+    [1] Type: QRCODE
+        Data: https://ip.bizzabo.com/events/807411/attendees/30856680
+
+============================================================
+  Connecting to Snowflake
+============================================================
+  Connection: cortexcli1
+  Database: DEMO.DEMO
+  Warehouse: INGEST
+
+============================================================
+  STEP 3b: Uploading Image to Snowflake Stage
+============================================================
+  File: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+  Stage: @DEMO.DEMO.BADGE_SCAN_STAGE
+  Status: UPLOADED
+  Directory refreshed.
+
+============================================================
+  STEP 4: Running Cortex AI Analysis
+============================================================
+  Model: pixtral-large
+  Analyzing: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+  Waiting for AI response...
+  Response received (406 chars)
+
+============================================================
+  STEP 6: Storing Metadata in Snowflake
+============================================================
+  Inserted into DEMO.DEMO.BADGE_SCANS
+  Row ID: 2301
+
+============================================================
+  SCAN RESULTS SUMMARY
+============================================================
+  Image File          : badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+  Stage Path          : @DEMO.DEMO.BADGE_SCAN_STAGE/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
+  Snowflake Row ID    : 2301
+
+  Environmental Sensor (BMP280):
+    Temperature : 25.47 C / 77.84 F
+    Pressure    : 1006.63 hPa
+    Est Altitude: 181.2 ft
+
+  QR / Barcode Data:
+    - [QRCODE] https://ip.bizzabo.com/events/807411/attendees/30856680
+
+  Badge Information (AI-extracted):
+    Name                : Timothy Spann
+    Title               : Sr Solution Engineer
+    Company             : Snowflake
+    Email               : (not detected)
+    Phone               : (not detected)
+    Conference          : DATA FOR BREAKFAST
+    Badge Type          : Employee
+
+    Summary: The badge is for Timothy Spann, a Sr Solution Engineer at Snowflake, attending the DATA FOR BREAKFAST conference. The badge type is Employee and includes a QR code.
+
+  Local LLM: Running async (moondream, gemma4:e2b)
+  Results will be stored in DEMO.DEMO.LOCAL_LLM_RESULTS
+
+============================================================
+  Done. Data stored in DEMO.DEMO.BADGE_SCANS
+============================================================
+
+
+============================================================
+  STEP 7: Async Local LLM Inference
+============================================================
+  Models : moondream, gemma4:e2b
+  Timeout: 300s
+  Scan ID: 2301
+
+============================================================
+  Local LLM Analysis (moondream via Ollama)
+  Started thread: llm-moondream
+============================================================
+
+============================================================
+  Local LLM Analysis (gemma4:e2b via Ollama)
+============================================================
+  Started thread: llm-gemma4:e2b
+  Image : /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg (base64, 234 KB)
+  Model : moondream
+  Server: http://localhost:11434
+  Waiting for local LLM response...
+  Image : /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg (base64, 234 KB)
+  Model : gemma4:e2b
+  Server: http://localhost:11434
+  Waiting for local LLM response...
+  Model loaded.
+  Response received (51 chars, 18 tokens, 85.5s)
+  ---
+  ids.timothy.spann.solutionengineer at snowflake.com
+  [moondream] Stored result in LOCAL_LLM_RESULTS (scan_id=2301)
+  [moondream] Finished.
+  Model loaded.
+
+  [gemma4:e2b] Exceeded 300s total wait -- abandoning.
+
+============================================================
+  All done. Badge scan + LLM results stored.
+  BADGE_SCANS row: 2301
+  LLM results in: DEMO.DEMO.LOCAL_LLM_RESULTS
+============================================================
+
+root@rp500:/opt/demo/badgescanner# 
+
+````
+
+
+
 ## Pipeline Steps
 
 | Step | What | How |
