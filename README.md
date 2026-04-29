@@ -399,3 +399,136 @@ All configuration constants are at the top of each file:
 | `BMP280_I2C_BUS` | badge_scanner.py | `1` | I2C bus number |
 | `BMP280_I2C_ADDR` | badge_scanner.py | `0x76` | BMP280 I2C address |
 | `CAMERA_INDEX` | badge_scanner.py | `0` | `/dev/videoN` index |
+
+
+
+## Newest Run
+
+````
+
+root@rp500:/opt/demo/badgescanner# python3 badge_scanner.py 
+[0:54:36.752149243] [3784]  INFO Camera camera_manager.cpp:340 libcamera v0.7.0+rpt20260205
+[0:54:36.760384694] [3790]  INFO Camera camera_manager.cpp:223 Adding camera '/base/axi/pcie@1000120000/rp1/usb@200000-1:1.0-046d:0892' for pipeline handler uvcvideo
+
+============================================================
+  SNOWFLAKE SUMMIT BADGE SCANNER
+  2026-04-29 14:36:56
+  Camera: HD Pro Webcam C920 (index 0)
+============================================================
+
+============================================================
+  STEP 1: Capturing Image from Webcam
+============================================================
+  Camera: HD Pro Webcam C920 (index 0)
+[0:54:36.769921641] [3784]  INFO Camera camera.cpp:1215 configuring streams: (0) 1920x1080-MJPEG/Rec709/Rec709/Rec601/Limited
+[0:54:37.353726565] [3790]  INFO V4L2 v4l2_videodevice.cpp:1913 /dev/video0[10:cap]: Zero sequence expected for first frame (got 1)
+  Captured image: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+  Resolution: 2304x1536
+  Size: 189.2 KB
+  Local path: /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+
+============================================================
+  STEP 2: Reading BMP280 Sensor
+============================================================
+  Temperature : 24.7 C / 76.4 F
+  Pressure    : 1001.0 hPa
+  Est Altitude: 336 ft
+
+============================================================
+  STEP 3: Scanning QR Codes & Barcodes
+============================================================
+  No QR codes or barcodes detected.
+
+============================================================
+  Connecting to Snowflake
+============================================================
+  Connection: cortexcli1
+  Database: DEMO.DEMO
+  Warehouse: INGEST
+
+============================================================
+  STEP 3b: Uploading Image to Snowflake Stage
+============================================================
+  File: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+  Stage: @DEMO.DEMO.BADGE_SCAN_STAGE
+  Status: UPLOADED
+  Directory refreshed.
+
+============================================================
+  STEP 4: Running Cortex AI Analysis
+============================================================
+  Model: pixtral-large
+  Analyzing: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+  Waiting for AI response...
+  Response received (406 chars)
+
+============================================================
+  STEP 6: Storing Metadata in Snowflake
+============================================================
+  Inserted into DEMO.DEMO.BADGE_SCANS
+  Row ID: 3101
+
+============================================================
+  SCAN RESULTS SUMMARY
+============================================================
+  Image File          : badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+  Stage Path          : @DEMO.DEMO.BADGE_SCAN_STAGE/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+  Snowflake Row ID    : 3101
+
+  Environmental Sensor (BMP280):
+    Temperature : 24.67 C / 76.4 F
+    Pressure    : 1001.01 hPa
+    Est Altitude: 336.0 ft
+
+  QR / Barcode Data: None detected
+
+  Badge Information (AI-extracted):
+    Name                : Timothy Spann
+    Title               : (not detected)
+    Company             : Systemative
+    Email               : (not detected)
+    Phone               : (not detected)
+    Conference          : DevNexus 22
+    Badge Type          : Gold Sponsor
+    Other Text          : Microsoft Azure
+
+    Summary: The badge is from the DevNexus 22 conference, indicating Timothy Spann from Systemative as a Gold Sponsor. The badge also includes a QR code and the Microsoft Azure logo.
+
+  Local LLM: Running async (moondream, gemma4:e2b)
+  Results will be stored in DEMO.DEMO.LOCAL_LLM_RESULTS
+
+============================================================
+  Done. Data stored in DEMO.DEMO.BADGE_SCANS
+============================================================
+
+
+============================================================
+  STEP 7: Async Local LLM Inference
+============================================================
+  Models : moondream, gemma4:e2b
+  Timeout: 300s
+  Scan ID: 3101
+
+============================================================
+  Started thread: llm-moondream
+  Local LLM Analysis (moondream via Ollama)
+============================================================
+
+============================================================
+  Started thread: llm-gemma4:e2b
+  Local LLM Analysis (gemma4:e2b via Ollama)
+============================================================
+  Image : /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg (base64, 252 KB)
+  Model : moondream
+  Server: http://localhost:11434
+  Waiting for local LLM response...
+  Image : /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg (base64, 252 KB)
+  Model : gemma4:e2b
+  Server: http://localhost:11434
+  Waiting for local LLM response...
+  Model loaded.
+
+
+
+
+````
