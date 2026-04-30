@@ -62,7 +62,7 @@ OLLAMA_URL = "http://localhost:11434"
 LOCAL_LLM_MODEL = "moondream"
 
 # Slack notifications
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+SLACK_WEBHOOK_URL = "FLAKEURL"
 SLACK_ENABLED = True
 
 
