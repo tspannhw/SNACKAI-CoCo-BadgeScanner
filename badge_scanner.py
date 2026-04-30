@@ -9,6 +9,7 @@ persists everything to Snowflake.
 Pipeline steps:
   1. Capture  – USB webcam image via picamera2 (1920x1080 MJPEG).
   2. Sensor   – BMP280 temperature / pressure / altitude via I2C (smbus2).
+  2b. Thermal – MLX90640 32x24 IR thermal frame via I2C (adafruit_mlx90640).
   3. QR Scan  – Decode barcodes and QR codes with pyzbar.
   3b. Upload  – PUT image to Snowflake internal stage (SNOWFLAKE_SSE).
   4. Cloud AI – Cortex COMPLETE (pixtral-large multimodal) extracts badge text.
@@ -17,13 +18,15 @@ Pipeline steps:
   7. Display  – Print formatted results to the terminal.
 
 Hardware requirements:
-  - Raspberry Pi 5 (tested) with USB webcam at /dev/video0
+  - Raspberry Pi 5 (tested) with USB webcam (auto-detected via picamera2)
+  - Tested cameras: Logitech C920, C922, C270, BRIO; generic UVC webcams
   - Pimoroni BMP280 on I2C bus 1, address 0x76
+  - Pimoroni MLX90640 thermal camera on I2C bus 1, address 0x33
   - Ollama running locally (http://localhost:11434) with moondream pulled
 
 Python dependencies:
   picamera2, pyzbar (+ libzbar0), Pillow, snowflake-connector-python,
-  smbus2, requests
+  smbus2, adafruit-circuitpython-mlx90640, requests
 
 Snowflake objects (DEMO.DEMO):
   - Stage:  BADGE_SCAN_STAGE  (internal, SNOWFLAKE_SSE, directory enabled)
@@ -33,9 +36,12 @@ Configuration is at the top of this file (connection name, database,
 stage, model names, I2C addresses, Ollama URL).
 
 Usage:
-  python3 badge_scanner.py
+  python3 badge_scanner.py                  # auto-select first USB camera
+  python3 badge_scanner.py --camera 0       # use camera index 0 explicitly
+  python3 badge_scanner.py --list-cameras   # list available cameras and exit
 """
 
+import argparse
 import base64
 import json
 import os
@@ -86,12 +92,20 @@ CAMERA_INDEX = 0
 BMP280_I2C_BUS = 1
 BMP280_I2C_ADDR = 0x76
 
+# MLX90640 thermal camera
+MLX90640_I2C_ADDR = 0x33
+MLX90640_REFRESH_RATE = 2  # Hz
+
 # Local Ollama LLM
 OLLAMA_URL = "http://localhost:11434"
 LOCAL_LLM_MODEL = "moondream"
 LOCAL_LLM_MODELS = ["moondream", "gemma4:e2b"]  # run both async
-LOCAL_LLM_WAIT = 300  # seconds; wait for async LLM threads to finish
+LOCAL_LLM_WAIT = 120  # seconds; wait for async LLM threads to finish
 LLM_RESULTS_TABLE = "LOCAL_LLM_RESULTS"
+
+# Slack notifications
+SLACK_WEBHOOK_URL = "PLACEHOLDER"
+SLACK_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -110,6 +124,152 @@ def print_field(label, value, indent=2):
         print(f"{prefix}{label:20s}: {value}")
     else:
         print(f"{prefix}{label:20s}: (not detected)")
+
+
+def send_to_slack(text, blocks=None):
+    """Post a message to Slack via incoming webhook. Fails silently."""
+    if not SLACK_ENABLED or not SLACK_WEBHOOK_URL:
+        return
+    payload = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"  [Slack] Warning: {resp.status_code} {resp.text[:100]}")
+    except Exception as e:
+        print(f"  [Slack] Warning: {e}")
+
+
+def get_presigned_image_url(conn, filename):
+    """Generate a temporary public URL for a staged image via Snowflake."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT GET_PRESIGNED_URL(@{DATABASE}.{SCHEMA}.{STAGE}, '{filename}', 3600)"
+        )
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"  [Slack] Presigned URL warning: {e}")
+        return None
+
+
+def notify_scan_results(conn, filename, parsed_ai, qr_results, sensor_data,
+                        capture_meta, row_id, thermal_gif_name=None):
+    """Send scan results to Slack with embedded badge image."""
+    cam = capture_meta or {}
+    ai = parsed_ai or {}
+    name = ai.get("name", "Unknown")
+    title = ai.get("title", "")
+    company = ai.get("company", "")
+    email = ai.get("email", "")
+    cam_model = cam.get("camera_model", "Unknown")
+    resolution = cam.get("resolution", "unknown")
+
+    temp = ""
+    if sensor_data and sensor_data.get("temperature_f") is not None:
+        temp = f"{sensor_data['temperature_f']}F / {sensor_data['temperature_c']}C"
+
+    qr_text = ""
+    if qr_results:
+        qr_text = ", ".join(r["data"][:80] for r in qr_results[:3])
+
+    lines = [
+        f"*Badge Scan Complete* (Row {row_id})",
+        f"*Name:* {name}",
+    ]
+    if title:
+        lines.append(f"*Title:* {title}")
+    if company:
+        lines.append(f"*Company:* {company}")
+    if email:
+        lines.append(f"*Email:* {email}")
+    if qr_text:
+        lines.append(f"*QR:* {qr_text}")
+    if temp:
+        lines.append(f"*Temp:* {temp}")
+    thermal = sensor_data.get("thermal") if sensor_data else None
+    if thermal and thermal.get("hotspot_temp_c") is not None:
+        lines.append(f"*Thermal:* {thermal['hotspot_temp_c']}C hotspot, {thermal['human_pixels']} body pixels")
+    lines.append(f"*Camera:* {cam_model} ({resolution})")
+    lines.append(f"*Image:* {filename}")
+
+    fallback_text = "\n".join(lines)
+
+    # Build Block Kit blocks with embedded image
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": fallback_text},
+        }
+    ]
+
+    image_url = get_presigned_image_url(conn, filename)
+    if image_url:
+        blocks.append({
+            "type": "image",
+            "image_url": image_url,
+            "alt_text": f"Badge scan: {filename}",
+            "title": {"type": "plain_text", "text": filename},
+        })
+
+    # Embed thermal heatmap GIF if available
+    if thermal_gif_name:
+        thermal_url = get_presigned_image_url(conn, thermal_gif_name)
+        if thermal_url:
+            blocks.append({
+                "type": "image",
+                "image_url": thermal_url,
+                "alt_text": f"Thermal heatmap: {thermal_gif_name}",
+                "title": {"type": "plain_text", "text": "Thermal Heatmap (MLX90640)"},
+            })
+
+    send_to_slack(fallback_text, blocks=blocks)
+
+
+# ---------------------------------------------------------------------------
+# Camera Discovery & Selection
+# ---------------------------------------------------------------------------
+
+def discover_cameras():
+    """Return list of cameras detected by picamera2/libcamera.
+
+    Each entry is a dict with keys: Num, Model, Id, and Location.
+    USB cameras have 'usb' in their Id string.
+    """
+    return Picamera2.global_camera_info()
+
+
+def select_camera(cameras, preferred_index=None):
+    """Pick a camera index from the discovered list.
+
+    If *preferred_index* is given, validate it exists and return it.
+    Otherwise auto-select the first USB camera (Id contains 'usb'),
+    falling back to camera 0 if no USB match is found.
+
+    Returns (index, camera_info_dict).
+    """
+    if not cameras:
+        raise RuntimeError("No cameras detected by picamera2")
+
+    if preferred_index is not None:
+        for cam in cameras:
+            if cam["Num"] == preferred_index:
+                return preferred_index, cam
+        available = ", ".join(str(c["Num"]) for c in cameras)
+        raise RuntimeError(
+            f"Camera index {preferred_index} not found. Available: {available}"
+        )
+
+    # Auto-select: prefer USB cameras
+    for cam in cameras:
+        if "usb" in cam.get("Id", "").lower():
+            return cam["Num"], cam
+
+    # Fallback: first camera
+    return cameras[0]["Num"], cameras[0]
 
 
 # ---------------------------------------------------------------------------
@@ -219,19 +379,209 @@ def read_bmp280_sensor():
 
 
 # ---------------------------------------------------------------------------
+# MLX90640 Thermal Camera Reading (adafruit-circuitpython-mlx90640)
+# ---------------------------------------------------------------------------
+
+def read_mlx90640_sensor():
+    """Read a thermal frame from the MLX90640 32x24 IR sensor array.
+
+    Returns summary statistics (min/max/mean/hotspot temperatures) and a
+    count of pixels above 30 C (rough human-presence indicator).  The full
+    768-element frame is included for downstream storage/analysis.
+    """
+    print_section("STEP 2b: Reading MLX90640 Thermal Camera")
+
+    try:
+        import board
+        import busio
+        import adafruit_mlx90640
+
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=800000)
+        mlx = adafruit_mlx90640.MLX90640(i2c)
+        mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_2_HZ
+
+        frame = [0] * 768
+        # MLX90640 occasionally raises ValueError on read; retry a few times
+        for _attempt in range(5):
+            try:
+                mlx.getFrame(frame)
+                break
+            except ValueError:
+                time.sleep(0.5)
+        else:
+            raise RuntimeError("Failed to read MLX90640 frame after 5 retries")
+
+        # Compute summary statistics
+        valid = [t for t in frame if t > -40]
+        if not valid:
+            raise RuntimeError("No valid temperature readings in frame")
+
+        thermal_min = min(valid)
+        thermal_max = max(valid)
+        thermal_mean = sum(valid) / len(valid)
+        human_pixels = sum(1 for t in valid if t > 30.0)
+
+        print(f"  Frame       : 32x24 ({len(valid)} valid pixels)")
+        print(f"  Min / Max   : {thermal_min:.1f} C / {thermal_max:.1f} C")
+        print(f"  Mean        : {thermal_mean:.1f} C")
+        print(f"  Hotspot     : {thermal_max:.1f} C / {thermal_max * 9/5 + 32:.1f} F")
+        print(f"  Human pixels: {human_pixels}/768 (>30 C)")
+
+        return {
+            "thermal_min_c": round(thermal_min, 2),
+            "thermal_max_c": round(thermal_max, 2),
+            "thermal_mean_c": round(thermal_mean, 2),
+            "hotspot_temp_c": round(thermal_max, 2),
+            "hotspot_temp_f": round(thermal_max * 9 / 5 + 32, 2),
+            "human_pixels": human_pixels,
+            "frame_shape": [24, 32],
+            "frame": [round(t, 1) for t in frame],
+        }
+
+    except Exception as e:
+        print(f"  ERROR reading MLX90640 sensor: {e}")
+        return {
+            "thermal_min_c": None,
+            "thermal_max_c": None,
+            "thermal_mean_c": None,
+            "hotspot_temp_c": None,
+            "hotspot_temp_f": None,
+            "human_pixels": None,
+            "frame_shape": None,
+            "frame": None,
+            "error": str(e),
+        }
+
+
+def generate_thermal_gif(thermal_data, output_dir):
+    """Generate a false-color thermal heatmap GIF from an MLX90640 frame.
+
+    Uses an iron/heat colormap (black -> blue -> red -> yellow -> white)
+    and bicubic upscaling from 32x24 to 320x240.
+    Returns (filepath, filename) or (None, None) on failure.
+    """
+    frame = thermal_data.get("frame") if thermal_data else None
+    if not frame or thermal_data.get("error"):
+        return None, None
+
+    try:
+        import colorsys
+
+        # Iron/heat colormap: maps 0.0-1.0 to thermal palette
+        def thermal_color(val):
+            """Map normalized value [0,1] to iron palette RGB tuple."""
+            # Piecewise linear: black -> blue -> magenta -> red -> yellow -> white
+            if val <= 0.0:
+                return (0, 0, 0)
+            elif val <= 0.2:
+                t = val / 0.2
+                return (0, 0, int(128 * t))
+            elif val <= 0.4:
+                t = (val - 0.2) / 0.2
+                return (int(128 * t), 0, int(128 + 127 * (1 - t)))
+            elif val <= 0.6:
+                t = (val - 0.4) / 0.2
+                return (int(128 + 127 * t), 0, int(128 * (1 - t)))
+            elif val <= 0.8:
+                t = (val - 0.6) / 0.2
+                return (255, int(255 * t), 0)
+            else:
+                t = min((val - 0.8) / 0.2, 1.0)
+                return (255, 255, int(255 * t))
+
+        # Determine temperature range for normalization
+        valid = [t for t in frame if t > -40]
+        if not valid:
+            return None, None
+        t_min = min(valid)
+        t_max = max(valid)
+        t_range = t_max - t_min if t_max > t_min else 1.0
+
+        # Build 32x24 image
+        img = Image.new('RGB', (32, 24))
+        for h in range(24):
+            for w in range(32):
+                temp = frame[h * 32 + w]
+                normalized = max(0.0, min(1.0, (temp - t_min) / t_range))
+                img.putpixel((w, h), thermal_color(normalized))
+
+        # Upscale to 320x240 with bicubic interpolation
+        img = img.resize((320, 240), Image.BICUBIC)
+
+        # Save as GIF
+        filename = f"thermal_{uuid.uuid4()}.gif"
+        filepath = os.path.join(output_dir, filename)
+        img.save(filepath)
+
+        print(f"  Thermal GIF: {filename} (320x240)")
+        return filepath, filename
+
+    except Exception as e:
+        print(f"  WARNING: Could not generate thermal GIF: {e}")
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Capture image from USB webcam
 # ---------------------------------------------------------------------------
 
-def capture_image(output_dir):
-    """Capture a JPEG image from the USB webcam using picamera2."""
+def capture_image(output_dir, camera_index=0, camera_info=None):
+    """Capture a JPEG image from a USB webcam using picamera2.
+
+    Adapts resolution to the camera's native capabilities.  Tries the
+    camera's full sensor size first, then common fallbacks.
+    Returns (filepath, filename, capture_meta) where capture_meta is a
+    dict with camera model, resolution, and index.
+    """
     print_section("STEP 1: Capturing Image from Webcam")
+
+    model_name = (camera_info or {}).get("Model", "Unknown")
+    print(f"  Camera: {model_name} (index {camera_index})")
 
     filename = f"badge_{uuid.uuid4()}.jpg"
     filepath = os.path.join(output_dir, filename)
 
-    cam = Picamera2(CAMERA_INDEX)
-    config = cam.create_still_configuration(main={"format": "RGB888"})
-    cam.configure(config)
+    cam = Picamera2(camera_index)
+
+    # Determine best resolution from camera properties
+    props = cam.camera_properties
+    native_size = props.get("PixelArraySize", (1920, 1080))
+    # Preference list: native max, then common fallbacks
+    resolutions = [
+        native_size,
+        (1920, 1080),
+        (1280, 720),
+        (640, 480),
+    ]
+    # De-duplicate while preserving order
+    seen = set()
+    unique_res = []
+    for r in resolutions:
+        if r not in seen:
+            seen.add(r)
+            unique_res.append(r)
+
+    # Try each resolution until one works
+    configured = False
+    used_size = None
+    for size in unique_res:
+        try:
+            config = cam.create_still_configuration(
+                main={"format": "RGB888", "size": size}
+            )
+            cam.configure(config)
+            configured = True
+            used_size = size
+            break
+        except Exception:
+            continue
+
+    if not configured:
+        # Last resort: let picamera2 choose defaults
+        config = cam.create_still_configuration(main={"format": "RGB888"})
+        cam.configure(config)
+        used_size = config["main"]["size"]
+
     cam.start()
     # Let the camera auto-exposure settle
     time.sleep(2)
@@ -241,9 +591,16 @@ def capture_image(output_dir):
 
     size_kb = os.path.getsize(filepath) / 1024
     print(f"  Captured image: {filename}")
+    print(f"  Resolution: {used_size[0]}x{used_size[1]}")
     print(f"  Size: {size_kb:.1f} KB")
     print(f"  Local path: {filepath}")
-    return filepath, filename
+
+    capture_meta = {
+        "camera_model": model_name,
+        "camera_index": camera_index,
+        "resolution": f"{used_size[0]}x{used_size[1]}",
+    }
+    return filepath, filename, capture_meta
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +777,13 @@ def analyze_with_local_llm(parsed_ai, sensor_data, qr_results,
         parts.append(f"  Pressure: {sensor_data['pressure_hpa']} hPa")
         parts.append(f"  Est. Altitude: {sensor_data['altitude_ft']} ft")
 
+    thermal = sensor_data.get("thermal") if sensor_data else None
+    if thermal and thermal.get("thermal_max_c") is not None:
+        parts.append("Thermal camera readings (MLX90640 32x24 IR):")
+        parts.append(f"  Hotspot: {thermal['hotspot_temp_c']} C / {thermal['hotspot_temp_f']} F")
+        parts.append(f"  Scene range: {thermal['thermal_min_c']} C to {thermal['thermal_max_c']} C")
+        parts.append(f"  Human-temp pixels (>30C): {thermal['human_pixels']}/768")
+
     context = "\n".join(parts) if parts else ""
 
     prompt = (
@@ -539,7 +903,7 @@ def analyze_with_local_llm(parsed_ai, sensor_data, qr_results,
 # ---------------------------------------------------------------------------
 
 def store_metadata(conn, filename, stage_path, qr_results, raw_ai, parsed_ai,
-                    sensor_data=None):
+                    sensor_data=None, capture_meta=None):
     """Insert a row into the BADGE_SCANS table with all extracted data."""
     print_section("STEP 6: Storing Metadata in Snowflake")
 
@@ -566,13 +930,20 @@ def store_metadata(conn, filename, stage_path, qr_results, raw_ai, parsed_ai,
     # Build notes from AI summary
     notes = f"[Cortex AI] {summary}" if summary else None
 
+    # Build capture device description from camera metadata
+    cam_meta = capture_meta or {}
+    cam_model = cam_meta.get("camera_model", "Unknown")
+    cam_res = cam_meta.get("resolution", "unknown")
+    capture_device = f"{cam_model} (picamera2, {cam_res})"
+
     metadata = json.dumps({
         "qr_codes": qr_results,
         "ai_model": AI_MODEL,
         "ai_raw_response": raw_ai,
         "ai_parsed": parsed_ai,
         "sensor_readings": sensor_data,
-        "capture_device": "USB Webcam (picamera2)",
+        "capture_device": capture_device,
+        "camera": cam_meta,
         "scan_time": datetime.now().isoformat(),
     })
 
@@ -700,7 +1071,7 @@ def run_llm_and_store(model_name, scan_id, parsed_ai, sensor_data,
 # ---------------------------------------------------------------------------
 
 def display_results(filename, stage_path, qr_results, raw_ai, parsed_ai,
-                    row_id, sensor_data=None):
+                    row_id, sensor_data=None, thermal_gif_name=None):
     """Print a formatted summary of all results."""
     print_section("SCAN RESULTS SUMMARY")
 
@@ -719,6 +1090,20 @@ def display_results(filename, stage_path, qr_results, raw_ai, parsed_ai,
         print(f"  Environmental Sensor: ERROR - {sensor_data['error']}")
     else:
         print("  Environmental Sensor: Not available")
+
+    # Thermal camera readings
+    thermal = sensor_data.get("thermal") if sensor_data else None
+    if thermal and thermal.get("thermal_max_c") is not None:
+        print("  Thermal Camera (MLX90640):")
+        print(f"    Min / Max / Mean: {thermal['thermal_min_c']} C / {thermal['thermal_max_c']} C / {thermal['thermal_mean_c']} C")
+        print(f"    Hotspot (body)  : {thermal['hotspot_temp_c']} C / {thermal['hotspot_temp_f']} F")
+        print(f"    Human pixels    : {thermal['human_pixels']}/768 (>30 C)")
+        if thermal_gif_name:
+            print(f"    Thermal GIF     : {thermal_gif_name}")
+    elif thermal and thermal.get("error"):
+        print(f"  Thermal Camera: ERROR - {thermal['error']}")
+    else:
+        print("  Thermal Camera: Not available")
     print()
 
     # QR Code results
@@ -765,18 +1150,70 @@ def display_results(filename, stage_path, qr_results, raw_ai, parsed_ai,
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main(camera_override=None):
+    parser = argparse.ArgumentParser(
+        description="Snowflake Summit Badge Scanner — capture, analyse, store.",
+    )
+    parser.add_argument(
+        "--camera", type=int, default=None,
+        help="Camera index to use (default: auto-select first USB camera)",
+    )
+    parser.add_argument(
+        "--list-cameras", action="store_true",
+        help="List available cameras and exit",
+    )
+
+    # When called programmatically (e.g. from manage.py), skip argparse to
+    # avoid conflicts with the caller's argv.
+    if camera_override is not None:
+        preferred_camera = camera_override
+        list_cameras = False
+    else:
+        args = parser.parse_args()
+        preferred_camera = args.camera
+        list_cameras = args.list_cameras
+
+    # Discover cameras
+    cameras = discover_cameras()
+
+    if list_cameras:
+        print(f"\nDetected {len(cameras)} camera(s):\n")
+        for cam in cameras:
+            is_usb = "usb" in cam.get("Id", "").lower()
+            tag = " [USB]" if is_usb else ""
+            print(f"  Index {cam['Num']}: {cam['Model']}{tag}")
+            print(f"           Id: {cam['Id']}")
+        if cameras:
+            idx, info = select_camera(cameras, preferred_camera)
+            print(f"\n  Auto-selected: index {idx} ({info['Model']})\n")
+        else:
+            print("  No cameras found.\n")
+        return
+
+    # Select camera
+    cam_index, cam_info = select_camera(cameras, preferred_camera)
+
     print("\n" + "=" * 60)
     print("  SNOWFLAKE SUMMIT BADGE SCANNER")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Camera: {cam_info['Model']} (index {cam_index})")
     print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Step 1: Capture image
-        filepath, filename = capture_image(tmpdir)
+        filepath, filename, capture_meta = capture_image(
+            tmpdir, camera_index=cam_index, camera_info=cam_info,
+        )
 
         # Step 2: Read BMP280 sensor
         sensor_data = read_bmp280_sensor()
+
+        # Step 2b: Read MLX90640 thermal camera
+        thermal_data = read_mlx90640_sensor()
+        sensor_data["thermal"] = thermal_data
+
+        # Step 2c: Generate thermal heatmap GIF
+        thermal_gif_path, thermal_gif_name = generate_thermal_gif(thermal_data, tmpdir)
 
         # Step 3: Scan QR codes
         qr_results = scan_qr_codes(filepath)
@@ -791,6 +1228,10 @@ def main():
         try:
             stage_path = upload_to_stage(conn, filepath, filename)
 
+            # Upload thermal GIF if generated
+            if thermal_gif_path:
+                upload_to_stage(conn, thermal_gif_path, thermal_gif_name)
+
             # Step 4: AI analysis (Cortex, cloud)
             raw_ai, parsed_ai = analyze_with_ai(conn, filename)
 
@@ -798,12 +1239,20 @@ def main():
             row_id = store_metadata(
                 conn, filename, stage_path, qr_results, raw_ai, parsed_ai,
                 sensor_data=sensor_data,
+                capture_meta=capture_meta,
             )
 
             # Step 6: Display results right away
             display_results(
                 filename, stage_path, qr_results, raw_ai, parsed_ai, row_id,
                 sensor_data=sensor_data,
+                thermal_gif_name=thermal_gif_name,
+            )
+
+            # Notify Slack
+            notify_scan_results(
+                conn, filename, parsed_ai, qr_results, sensor_data,
+                capture_meta, row_id, thermal_gif_name=thermal_gif_name,
             )
         finally:
             conn.close()

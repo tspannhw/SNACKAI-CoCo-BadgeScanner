@@ -4,173 +4,27 @@ End-to-end CLI pipeline running on a Raspberry Pi 5 that captures conference
 badge images, reads environmental sensor data, performs cloud and edge AI
 analysis, and persists everything to Snowflake.
 
-## Example Run
-
-````
-
-root@rp500:/opt/demo/badgescanner# python badge_scanner.py 
-[0:35:02.955272010] [3678]  INFO Camera camera_manager.cpp:340 libcamera v0.7.0+rpt20260205
-[0:35:02.964385042] [3684]  INFO Camera camera_manager.cpp:223 Adding camera '/base/axi/pcie@1000120000/rp1/usb@200000-1:1.0-046d:0892' for pipeline handler uvcvideo
-
-============================================================
-  SNOWFLAKE SUMMIT BADGE SCANNER
-  2026-04-28 17:21:28
-  Camera: HD Pro Webcam C920 (index 0)
-============================================================
-
-============================================================
-  STEP 1: Capturing Image from Webcam
-============================================================
-  Camera: HD Pro Webcam C920 (index 0)
-[0:35:02.976835429] [3678]  INFO Camera camera.cpp:1215 configuring streams: (0) 1920x1080-MJPEG/Rec709/Rec709/Rec601/Limited
-[0:35:03.629797279] [3684]  INFO V4L2 v4l2_videodevice.cpp:1913 /dev/video0[10:cap]: Zero sequence expected for first frame (got 1)
-  Captured image: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-  Resolution: 2304x1536
-  Size: 176.1 KB
-  Local path: /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-
-============================================================
-  STEP 2: Reading BMP280 Sensor
-============================================================
-  Temperature : 25.5 C / 77.8 F
-  Pressure    : 1006.6 hPa
-  Est Altitude: 181 ft
-
-============================================================
-  STEP 3: Scanning QR Codes & Barcodes
-============================================================
-  Found 1 code(s):
-    [1] Type: QRCODE
-        Data: https://ip.bizzabo.com/events/807411/attendees/30856680
-
-============================================================
-  Connecting to Snowflake
-============================================================
-  Connection: cortexcli1
-  Database: DEMO.DEMO
-  Warehouse: INGEST
-
-============================================================
-  STEP 3b: Uploading Image to Snowflake Stage
-============================================================
-  File: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-  Stage: @DEMO.DEMO.BADGE_SCAN_STAGE
-  Status: UPLOADED
-  Directory refreshed.
-
-============================================================
-  STEP 4: Running Cortex AI Analysis
-============================================================
-  Model: pixtral-large
-  Analyzing: badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-  Waiting for AI response...
-  Response received (406 chars)
-
-============================================================
-  STEP 6: Storing Metadata in Snowflake
-============================================================
-  Inserted into DEMO.DEMO.BADGE_SCANS
-  Row ID: 2301
-
-============================================================
-  SCAN RESULTS SUMMARY
-============================================================
-  Image File          : badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-  Stage Path          : @DEMO.DEMO.BADGE_SCAN_STAGE/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg
-  Snowflake Row ID    : 2301
-
-  Environmental Sensor (BMP280):
-    Temperature : 25.47 C / 77.84 F
-    Pressure    : 1006.63 hPa
-    Est Altitude: 181.2 ft
-
-  QR / Barcode Data:
-    - [QRCODE] https://ip.bizzabo.com/events/807411/attendees/30856680
-
-  Badge Information (AI-extracted):
-    Name                : Timothy Spann
-    Title               : Sr Solution Engineer
-    Company             : Snowflake
-    Email               : (not detected)
-    Phone               : (not detected)
-    Conference          : DATA FOR BREAKFAST
-    Badge Type          : Employee
-
-    Summary: The badge is for Timothy Spann, a Sr Solution Engineer at Snowflake, attending the DATA FOR BREAKFAST conference. The badge type is Employee and includes a QR code.
-
-  Local LLM: Running async (moondream, gemma4:e2b)
-  Results will be stored in DEMO.DEMO.LOCAL_LLM_RESULTS
-
-============================================================
-  Done. Data stored in DEMO.DEMO.BADGE_SCANS
-============================================================
-
-
-============================================================
-  STEP 7: Async Local LLM Inference
-============================================================
-  Models : moondream, gemma4:e2b
-  Timeout: 300s
-  Scan ID: 2301
-
-============================================================
-  Local LLM Analysis (moondream via Ollama)
-  Started thread: llm-moondream
-============================================================
-
-============================================================
-  Local LLM Analysis (gemma4:e2b via Ollama)
-============================================================
-  Started thread: llm-gemma4:e2b
-  Image : /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg (base64, 234 KB)
-  Model : moondream
-  Server: http://localhost:11434
-  Waiting for local LLM response...
-  Image : /tmp/tmpw9c1551c/badge_ef5b3cfe-6a22-41ba-b0c1-f1941a69d2c3.jpg (base64, 234 KB)
-  Model : gemma4:e2b
-  Server: http://localhost:11434
-  Waiting for local LLM response...
-  Model loaded.
-  Response received (51 chars, 18 tokens, 85.5s)
-  ---
-  ids.timothy.spann.solutionengineer at snowflake.com
-  [moondream] Stored result in LOCAL_LLM_RESULTS (scan_id=2301)
-  [moondream] Finished.
-  Model loaded.
-
-  [gemma4:e2b] Exceeded 300s total wait -- abandoning.
-
-============================================================
-  All done. Badge scan + LLM results stored.
-  BADGE_SCANS row: 2301
-  LLM results in: DEMO.DEMO.LOCAL_LLM_RESULTS
-============================================================
-
-root@rp500:/opt/demo/badgescanner# 
-
-````
-
-
-
 ## Pipeline Steps
 
 | Step | What | How |
 |------|------|-----|
-| 1. Capture | USB webcam photo (1920x1080 MJPEG) | fswebcam `/dev/video0` |
+| 1. Capture | USB webcam photo (auto-resolution) | picamera2 with auto-detection |
 | 2. Sensor | Temperature, pressure, altitude | BMP280 via I2C (smbus2) |
+| 2b. Thermal | 32x24 IR thermal frame (hotspot, human detection) | MLX90640 via I2C (adafruit-circuitpython-mlx90640) |
 | 3. QR Scan | Decode barcodes and QR codes | pyzbar + libzbar0 |
 | 3b. Upload | PUT image to Snowflake internal stage | SNOWFLAKE_SSE encryption |
 | 4. Cloud AI | Extract badge text (name, title, company) | Cortex COMPLETE (pixtral-large multimodal) |
 | 5. Store | INSERT metadata row immediately | DEMO.DEMO.BADGE_SCANS |
 | 6. Display | Print formatted results | Terminal output |
-| 7. Edge AI | Async vision + text LLM inference | Ollama moondream + gemma4:e2b (parallel threads) |
+| 7. Edge AI | Async vision + text LLM inference | Ollama moondream + gemma4:e2b (parallel threads, both scan image) |
 | 7b. Store LLM | INSERT each model's result | DEMO.DEMO.LOCAL_LLM_RESULTS |
 
 ## Hardware
 
 - Raspberry Pi 5
-- USB webcam at `/dev/video0`
+- USB UVC webcam (tested: Logitech C920, C270; any libcamera-compatible USB camera should work)
 - Pimoroni BMP280 breakout on I2C bus 1, address `0x76`
+- Pimoroni MLX90640 thermal camera breakout on I2C bus 1, address `0x33`
 
 ## Software Prerequisites
 
@@ -182,6 +36,7 @@ root@rp500:/opt/demo/badgescanner#
 | pyzbar, Pillow | `pip install pyzbar Pillow` |
 | snowflake-connector-python | `pip install snowflake-connector-python` |
 | smbus2 | `pip install smbus2` |
+| adafruit-circuitpython-mlx90640 | `pip install adafruit-circuitpython-mlx90640` |
 | requests | `pip install requests` |
 | Ollama | [ollama.com](https://ollama.com) with `ollama pull moondream && ollama pull gemma4:e2b` |
 
@@ -263,8 +118,8 @@ CREATE OR REPLACE TABLE LOCAL_LLM_RESULTS (
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `badge_scanner.py` | 854 | Main pipeline with async LLM threads |
-| `manage.py` | 514 | Management CLI (start/stop/scan/list/test/validate) |
+| `badge_scanner.py` | ~1006 | Main pipeline with multi-camera support and async LLM threads |
+| `manage.py` | ~536 | Management CLI (start/stop/scan/list/test/validate) |
 | `test_ollama.py` | 212 | Standalone Ollama vision test tool |
 
 ## Usage
@@ -278,12 +133,18 @@ python3 manage.py start
 # 2. Run pre-flight health checks
 python3 manage.py test
 
-# 3. Scan a badge (full pipeline)
+# 3. List available cameras
+python3 badge_scanner.py --list-cameras
+
+# 4. Scan a badge (auto-selects first USB camera)
 python3 manage.py scan
+# or with a specific camera:
+python3 manage.py scan --camera 0
 # or directly:
 python3 badge_scanner.py
+python3 badge_scanner.py --camera 0
 
-# 4. List recent scans
+# 5. List recent scans
 python3 manage.py list
 python3 manage.py list --limit 25
 ```
@@ -296,7 +157,7 @@ python3 manage.py <command>
 Commands:
   start      Start Ollama, check/install libzbar0 and pyzbar
   stop       Stop the Ollama service
-  scan       Run the full badge_scanner.py pipeline
+  scan       Run the full badge_scanner.py pipeline (--camera N to pick camera)
   list       Query BADGE_SCANS and display recent rows (--limit N)
   test       11 pre-flight health checks (camera, sensor, Ollama, Snowflake, deps)
   validate   5 static code checks (syntax, AST, schema, pipeline, bind params)
@@ -315,8 +176,9 @@ python3 test_ollama.py photo.jpg --timeout 30       # custom timeout
 ## Architecture
 
 ```
-USB Webcam ──> picamera2 ──> JPEG file ──> pyzbar (QR decode)
-                                │
+USB Webcam(s) ──> picamera2 ──> JPEG file ──> pyzbar (QR decode)
+  (auto-detect)        │
+                       │  native resolution
 BMP280 (I2C) ──> smbus2 ──────>│
                                 │
                          badge_scanner.py
@@ -332,7 +194,7 @@ BMP280 (I2C) ──> smbus2 ──────>│
               fork daemon threads (step 7)
                /              \
           moondream        gemma4:e2b
-         (vision)         (text-only)
+         (vision)       (vision+thinking)
               \              /
           LOCAL_LLM_RESULTS
         (each thread stores independently)
@@ -360,7 +222,12 @@ Each row's `METADATA` column stores a JSON object:
     "pressure_hpa": 1013.2,
     "altitude_ft": 30.5
   },
-  "capture_device": "USB Webcam (picamera2)",
+  "camera": {
+    "camera_model": "HD Pro Webcam C920",
+    "camera_index": 0,
+    "resolution": "2304x1536"
+  },
+  "capture_device": "HD Pro Webcam C920 (picamera2, 2304x1536)",
   "scan_time": "2025-06-10T14:30:00"
 }
 ```
@@ -373,10 +240,11 @@ connection.
 
 After storing to Snowflake and displaying results, the pipeline forks one daemon
 thread per model in `LOCAL_LLM_MODELS` (default: moondream + gemma4:e2b). Both
-threads run in parallel. The main process waits up to `LOCAL_LLM_WAIT` seconds
-(default 180) total -- the deadline is shared, so if moondream finishes in 60s,
-gemma4:e2b gets the remaining 120s. Any thread still running after the deadline
-is abandoned (daemon threads exit when the process exits).
+models receive the base64-encoded badge image and run in parallel. The main
+process waits up to `LOCAL_LLM_WAIT` seconds (default 300, i.e. 5 minutes)
+total -- the deadline is shared, so if moondream finishes in 60s, gemma4:e2b
+gets the remaining 240s. Any thread still running after the deadline is
+abandoned (daemon threads exit when the process exits).
 
 Each thread opens its own Snowflake connection and INSERTs to
 `LOCAL_LLM_RESULTS` independently, avoiding contention on the main connection.
@@ -393,142 +261,54 @@ All configuration constants are at the top of each file:
 | `AI_MODEL` | badge_scanner.py | `pixtral-large` | Cortex multimodal model |
 | `LOCAL_LLM_MODEL` | badge_scanner.py | `moondream` | Default Ollama model |
 | `LOCAL_LLM_MODELS` | badge_scanner.py | `["moondream", "gemma4:e2b"]` | Models to run async |
-| `LOCAL_LLM_WAIT` | badge_scanner.py | `180` | Total seconds to wait for LLM threads |
+| `LOCAL_LLM_WAIT` | badge_scanner.py | `300` | Total seconds (5 min) to wait for LLM threads |
 | `LLM_RESULTS_TABLE` | badge_scanner.py | `LOCAL_LLM_RESULTS` | Table for async LLM results |
 | `OLLAMA_URL` | badge_scanner.py | `http://localhost:11434` | Ollama API endpoint |
 | `BMP280_I2C_BUS` | badge_scanner.py | `1` | I2C bus number |
 | `BMP280_I2C_ADDR` | badge_scanner.py | `0x76` | BMP280 I2C address |
-| `CAMERA_INDEX` | badge_scanner.py | `0` | `/dev/videoN` index |
+| `SLACK_WEBHOOK_URL` | both | (set) | Slack incoming webhook URL |
+| `SLACK_ENABLED` | both | `True` | Set `False` to disable Slack notifications |
 
+### Multi-Camera Support
 
+The scanner auto-detects cameras via `Picamera2.global_camera_info()` (libcamera).
+USB UVC cameras are preferred over CSI cameras. Resolution is negotiated
+automatically — the scanner tries native sensor resolution first, then falls back
+through 1920x1080, 1280x720, and 640x480.
 
-## Newest Run
+```bash
+# List detected cameras
+python3 badge_scanner.py --list-cameras
 
-````
+# Use a specific camera by index
+python3 badge_scanner.py --camera 1
+python3 manage.py scan --camera 1
+```
 
-root@rp500:/opt/demo/badgescanner# python3 badge_scanner.py 
-[0:54:36.752149243] [3784]  INFO Camera camera_manager.cpp:340 libcamera v0.7.0+rpt20260205
-[0:54:36.760384694] [3790]  INFO Camera camera_manager.cpp:223 Adding camera '/base/axi/pcie@1000120000/rp1/usb@200000-1:1.0-046d:0892' for pipeline handler uvcvideo
+**Tested cameras:**
 
-============================================================
-  SNOWFLAKE SUMMIT BADGE SCANNER
-  2026-04-29 14:36:56
-  Camera: HD Pro Webcam C920 (index 0)
-============================================================
+| Camera | Interface | Native Resolution |
+|--------|-----------|-------------------|
+| Logitech C920 (HD Pro) | USB | 2304x1536 |
+| Logitech C270 | USB | 1280x720 |
+| Raspberry Pi Camera Module | CSI | varies |
 
-============================================================
-  STEP 1: Capturing Image from Webcam
-============================================================
-  Camera: HD Pro Webcam C920 (index 0)
-[0:54:36.769921641] [3784]  INFO Camera camera.cpp:1215 configuring streams: (0) 1920x1080-MJPEG/Rec709/Rec709/Rec601/Limited
-[0:54:37.353726565] [3790]  INFO V4L2 v4l2_videodevice.cpp:1913 /dev/video0[10:cap]: Zero sequence expected for first frame (got 1)
-  Captured image: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
-  Resolution: 2304x1536
-  Size: 189.2 KB
-  Local path: /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
+Camera model, index, and capture resolution are stored in the `METADATA` VARIANT
+column under the `camera` key for every scan.
 
-============================================================
-  STEP 2: Reading BMP280 Sensor
-============================================================
-  Temperature : 24.7 C / 76.4 F
-  Pressure    : 1001.0 hPa
-  Est Altitude: 336 ft
+### Slack Notifications
 
-============================================================
-  STEP 3: Scanning QR Codes & Barcodes
-============================================================
-  No QR codes or barcodes detected.
+All pipeline outputs are sent to Slack via an incoming webhook:
 
-============================================================
-  Connecting to Snowflake
-============================================================
-  Connection: cortexcli1
-  Database: DEMO.DEMO
-  Warehouse: INGEST
+| Event | Message |
+|-------|---------|
+| `manage.py scan` | Badge scan results (name, company, camera, temp, QR data) + **scanned image** |
+| `manage.py test` | Health check pass/fail summary |
+| `manage.py validate` | Static validation pass/fail summary |
 
-============================================================
-  STEP 3b: Uploading Image to Snowflake Stage
-============================================================
-  File: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
-  Stage: @DEMO.DEMO.BADGE_SCAN_STAGE
-  Status: UPLOADED
-  Directory refreshed.
+Scan notifications embed the captured badge image directly in Slack using a
+Snowflake pre-signed URL (`GET_PRESIGNED_URL`, 1-hour expiry). The image
+appears inline below the scan metadata.
 
-============================================================
-  STEP 4: Running Cortex AI Analysis
-============================================================
-  Model: pixtral-large
-  Analyzing: badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
-  Waiting for AI response...
-  Response received (406 chars)
-
-============================================================
-  STEP 6: Storing Metadata in Snowflake
-============================================================
-  Inserted into DEMO.DEMO.BADGE_SCANS
-  Row ID: 3101
-
-============================================================
-  SCAN RESULTS SUMMARY
-============================================================
-  Image File          : badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
-  Stage Path          : @DEMO.DEMO.BADGE_SCAN_STAGE/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg
-  Snowflake Row ID    : 3101
-
-  Environmental Sensor (BMP280):
-    Temperature : 24.67 C / 76.4 F
-    Pressure    : 1001.01 hPa
-    Est Altitude: 336.0 ft
-
-  QR / Barcode Data: None detected
-
-  Badge Information (AI-extracted):
-    Name                : Timothy Spann
-    Title               : (not detected)
-    Company             : Systemative
-    Email               : (not detected)
-    Phone               : (not detected)
-    Conference          : DevNexus 22
-    Badge Type          : Gold Sponsor
-    Other Text          : Microsoft Azure
-
-    Summary: The badge is from the DevNexus 22 conference, indicating Timothy Spann from Systemative as a Gold Sponsor. The badge also includes a QR code and the Microsoft Azure logo.
-
-  Local LLM: Running async (moondream, gemma4:e2b)
-  Results will be stored in DEMO.DEMO.LOCAL_LLM_RESULTS
-
-============================================================
-  Done. Data stored in DEMO.DEMO.BADGE_SCANS
-============================================================
-
-
-============================================================
-  STEP 7: Async Local LLM Inference
-============================================================
-  Models : moondream, gemma4:e2b
-  Timeout: 300s
-  Scan ID: 3101
-
-============================================================
-  Started thread: llm-moondream
-  Local LLM Analysis (moondream via Ollama)
-============================================================
-
-============================================================
-  Started thread: llm-gemma4:e2b
-  Local LLM Analysis (gemma4:e2b via Ollama)
-============================================================
-  Image : /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg (base64, 252 KB)
-  Model : moondream
-  Server: http://localhost:11434
-  Waiting for local LLM response...
-  Image : /tmp/tmp54a7egi7/badge_84a78070-6c3d-4638-aed3-7cd6808cae85.jpg (base64, 252 KB)
-  Model : gemma4:e2b
-  Server: http://localhost:11434
-  Waiting for local LLM response...
-  Model loaded.
-
-
-
-
-````
+To disable, set `SLACK_ENABLED = False` in both `badge_scanner.py` and `manage.py`.
+To change the channel, update `SLACK_WEBHOOK_URL` in both files.

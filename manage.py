@@ -13,15 +13,20 @@ Subcommands:
   list       Show recent scans from DEMO.DEMO.BADGE_SCANS.
   test       Pre-flight health checks (camera, sensor, Ollama, Snowflake).
   validate   Static code validation of badge_scanner.py.
+  dashboard  Rich terminal dashboard with analytics and metrics.
 
 Usage:
   python3 manage.py start
   python3 manage.py stop
   python3 manage.py scan
+  python3 manage.py scan --camera 1    # use specific camera index
   python3 manage.py list              # last 10 scans
   python3 manage.py list --limit 25   # last 25 scans
   python3 manage.py test
   python3 manage.py validate
+  python3 manage.py dashboard          # single-shot dashboard
+  python3 manage.py dashboard --live   # auto-refresh every 30s
+  python3 manage.py dashboard --compact # minimal view
 
 Prerequisites:
   - Raspberry Pi 5 with USB webcam, BMP280 on I2C bus 1
@@ -52,8 +57,26 @@ TABLE = "BADGE_SCANS"
 LLM_RESULTS_TABLE = "LOCAL_LLM_RESULTS"
 BMP280_I2C_BUS = 1
 BMP280_I2C_ADDR = 0x76
+MLX90640_I2C_ADDR = 0x33
 OLLAMA_URL = "http://localhost:11434"
 LOCAL_LLM_MODEL = "moondream"
+
+# Slack notifications
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+SLACK_ENABLED = True
+
+
+def send_to_slack(text):
+    """Post a message to Slack via incoming webhook. Fails silently."""
+    if not SLACK_ENABLED or not SLACK_WEBHOOK_URL:
+        return
+    try:
+        import requests as _req
+        resp = _req.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        if resp.status_code != 200:
+            print(f"  [Slack] Warning: {resp.status_code} {resp.text[:100]}")
+    except Exception as e:
+        print(f"  [Slack] Warning: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +159,9 @@ def cmd_scan(args):
     # Import inline to avoid heavy dependencies when running other commands
     sys.path.insert(0, os.path.dirname(SCANNER_PATH))
     import badge_scanner
+    camera_override = getattr(args, "camera", None)
     try:
-        badge_scanner.main()
+        badge_scanner.main(camera_override=camera_override)
         return 0
     except Exception as e:
         print(f"\nScan failed: {e}")
@@ -220,9 +244,24 @@ def cmd_test(args):
 
     print("\n=== Pre-flight Health Checks ===\n")
 
-    # 1. Camera
-    cam_ok = os.path.exists("/dev/video0")
-    check("USB Camera /dev/video0", cam_ok)
+    # 1. Camera (discover via picamera2)
+    cam_ok = False
+    cam_detail = ""
+    try:
+        from picamera2 import Picamera2
+        cameras = Picamera2.global_camera_info()
+        usb_cams = [c for c in cameras if "usb" in c.get("Id", "").lower()]
+        if cameras:
+            cam_ok = True
+            names = [f"{c['Model']} (idx {c['Num']})" for c in cameras]
+            cam_detail = f"{len(cameras)} camera(s): {', '.join(names)}"
+            if usb_cams:
+                cam_detail += f"; {len(usb_cams)} USB"
+        else:
+            cam_detail = "no cameras detected"
+    except Exception as e:
+        cam_detail = str(e)
+    check("Camera (picamera2 discovery)", cam_ok, cam_detail)
 
     # 2. BMP280 I2C sensor
     sensor_ok = False
@@ -237,6 +276,20 @@ def cmd_test(args):
     except Exception as e:
         sensor_detail = str(e)
     check("BMP280 I2C sensor (bus 1, 0x76)", sensor_ok, sensor_detail)
+
+    # 2b. MLX90640 thermal camera
+    mlx_ok = False
+    mlx_detail = ""
+    try:
+        import smbus2
+        bus = smbus2.SMBus(BMP280_I2C_BUS)
+        bus.read_byte(MLX90640_I2C_ADDR)
+        bus.close()
+        mlx_ok = True
+        mlx_detail = "addr=0x33"
+    except Exception as e:
+        mlx_detail = str(e)
+    check("MLX90640 thermal camera (bus 1, 0x33)", mlx_ok, mlx_detail)
 
     # 3. Ollama service
     ollama_active = False
@@ -351,6 +404,10 @@ def cmd_test(args):
     passed = sum(checks)
     total = len(checks)
     print(f"\n  Result: {passed}/{total} checks passed.\n")
+
+    status = "ALL PASSED" if all(checks) else f"{total - passed} FAILED"
+    send_to_slack(f"*Health Check:* {passed}/{total} passed ({status})")
+
     return 0 if all(checks) else 1
 
 
@@ -394,7 +451,10 @@ def cmd_validate(args):
     # 3. Pipeline coverage -- verify main() calls all pipeline functions
     print("  [3] Pipeline coverage...")
     pipeline_funcs = [
-        "capture_image", "read_bmp280_sensor", "scan_qr_codes",
+        "discover_cameras", "select_camera",
+        "capture_image", "read_bmp280_sensor", "read_mlx90640_sensor",
+        "generate_thermal_gif",
+        "scan_qr_codes",
         "get_snowflake_connection", "upload_to_stage", "analyze_with_ai",
         "run_llm_and_store", "store_metadata", "display_results",
     ]
@@ -469,10 +529,332 @@ def cmd_validate(args):
     # Summary
     if errors:
         print(f"\n  FAILED: {len(errors)} issue(s): {', '.join(errors)}\n")
+        send_to_slack(f"*Validation FAILED:* {len(errors)} issue(s): {', '.join(errors)}")
         return 1
     else:
         print(f"\n  ALL CHECKS PASSED.\n")
+        send_to_slack("*Validation:* ALL 5 CHECKS PASSED")
         return 0
+
+
+# ---------------------------------------------------------------------------
+# dashboard  (Rich terminal analytics)
+# ---------------------------------------------------------------------------
+
+def _get_snowflake_conn():
+    """Open a Snowflake connection for dashboard queries."""
+    import snowflake.connector
+    return snowflake.connector.connect(
+        connection_name=SNOWFLAKE_CONNECTION,
+        database=DATABASE,
+        schema=SCHEMA,
+        warehouse=WAREHOUSE,
+    )
+
+
+def _dashboard_summary(conn):
+    """Build a summary statistics panel."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT COUNT(*) AS TOTAL_SCANS,
+               COUNT(DISTINCT PARSED_NAME) AS UNIQUE_PEOPLE,
+               COUNT(DISTINCT PARSED_COMPANY) AS UNIQUE_COMPANIES,
+               AVG(METADATA:sensor_readings:temperature_f::FLOAT) AS AVG_TEMP_F,
+               MIN(SCAN_TIMESTAMP) AS FIRST_SCAN,
+               MAX(SCAN_TIMESTAMP) AS LAST_SCAN
+        FROM {DATABASE}.{SCHEMA}.{TABLE}
+    """)
+    row = cur.fetchone()
+    cur.close()
+
+    total, people, companies, avg_temp, first_scan, last_scan = row
+    avg_temp_str = f"{avg_temp:.1f}°F" if avg_temp else "N/A"
+    first_str = str(first_scan)[:19] if first_scan else "N/A"
+    last_str = str(last_scan)[:19] if last_scan else "N/A"
+
+    text = Text()
+    text.append("Total Scans:    ", style="bold")
+    text.append(f"{total}\n")
+    text.append("Unique People:  ", style="bold")
+    text.append(f"{people}\n")
+    text.append("Companies:      ", style="bold")
+    text.append(f"{companies}\n")
+    text.append("Avg Temp:       ", style="bold")
+    text.append(f"{avg_temp_str}\n")
+    text.append("First Scan:     ", style="bold")
+    text.append(f"{first_str}\n")
+    text.append("Last Scan:      ", style="bold")
+    text.append(f"{last_str}")
+
+    return Panel(text, title="[bold cyan]Summary[/bold cyan]", border_style="cyan")
+
+
+def _dashboard_sparkline(conn):
+    """Build a 24-hour scan activity sparkline panel."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT DATE_TRUNC('hour', SCAN_TIMESTAMP) AS HOUR, COUNT(*) AS SCANS
+        FROM {DATABASE}.{SCHEMA}.{TABLE}
+        WHERE SCAN_TIMESTAMP > DATEADD('day', -1, CURRENT_TIMESTAMP())
+        GROUP BY HOUR ORDER BY HOUR
+    """)
+    rows = cur.fetchall()
+    cur.close()
+
+    # Build hourly counts for last 24 hours
+    from datetime import datetime, timedelta
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    hours = {}
+    for r in rows:
+        h = str(r[0])[:13]  # "YYYY-MM-DD HH"
+        hours[h] = r[1]
+
+    blocks = "▁▂▃▄▅▆▇█"
+    counts = []
+    for i in range(24):
+        h = (now - timedelta(hours=23 - i)).strftime("%Y-%m-%d %H")
+        counts.append(hours.get(h, 0))
+
+    max_count = max(counts) if counts and max(counts) > 0 else 1
+    bar = ""
+    for c in counts:
+        idx = min(int(c / max_count * 7), 7) if c > 0 else 0
+        bar += blocks[idx]
+
+    text = Text()
+    text.append("Last 24h: ", style="bold")
+    text.append(bar, style="green")
+    text.append(f"  (peak: {max_count} scan/hr)")
+
+    return Panel(text, title="[bold green]Activity[/bold green]", border_style="green")
+
+
+def _dashboard_recent(conn):
+    """Build a recent scans table panel."""
+    from rich.panel import Panel
+    from rich.table import Table
+
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT ID, SCAN_TIMESTAMP, PARSED_NAME, PARSED_COMPANY,
+               PROCESSING_STATUS,
+               METADATA:sensor_readings:temperature_f::FLOAT AS TEMP_F,
+               METADATA:sensor_readings:thermal:hotspot_temp_c::FLOAT AS THERMAL_C
+        FROM {DATABASE}.{SCHEMA}.{TABLE}
+        ORDER BY ID DESC LIMIT 10
+    """)
+    rows = cur.fetchall()
+    cur.close()
+
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("ID", style="dim", width=5)
+    table.add_column("Time", width=16)
+    table.add_column("Name", width=18)
+    table.add_column("Company", width=16)
+    table.add_column("Status", width=10)
+    table.add_column("Temp", width=7, justify="right")
+    table.add_column("Thermal", width=7, justify="right")
+
+    for row in rows:
+        rid = str(row[0]) if row[0] else ""
+        ts = str(row[1])[5:16] if row[1] else ""
+        name = (row[2] or "")[:17]
+        company = (row[3] or "")[:15]
+        status = row[4] or ""
+        temp_f = f"{row[5]:.0f}F" if row[5] else "-"
+        thermal = f"{row[6]:.1f}C" if row[6] else "-"
+
+        # Color code status
+        if status == "PROCESSED":
+            status_style = "green"
+        elif status == "PENDING":
+            status_style = "yellow"
+        else:
+            status_style = "red"
+
+        # Color code temperature
+        temp_style = "green"
+        if row[5] and row[5] > 80:
+            temp_style = "red"
+        elif row[5] and row[5] > 75:
+            temp_style = "yellow"
+
+        table.add_row(
+            rid, ts, name, company,
+            f"[{status_style}]{status}[/{status_style}]",
+            f"[{temp_style}]{temp_f}[/{temp_style}]",
+            thermal,
+        )
+
+    return Panel(table, title="[bold magenta]Recent Scans[/bold magenta]", border_style="magenta")
+
+
+def _dashboard_health():
+    """Build a compact system health panel."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    checks = []
+
+    # Camera
+    try:
+        from picamera2 import Picamera2
+        cameras = Picamera2.global_camera_info()
+        checks.append(("Camera", bool(cameras), f"{len(cameras)} found"))
+    except Exception as e:
+        checks.append(("Camera", False, str(e)[:30]))
+
+    # BMP280
+    try:
+        import smbus2
+        bus = smbus2.SMBus(BMP280_I2C_BUS)
+        chip_id = bus.read_byte_data(BMP280_I2C_ADDR, 0xD0)
+        bus.close()
+        checks.append(("BMP280", chip_id == 0x58, f"0x{chip_id:02X}"))
+    except Exception as e:
+        checks.append(("BMP280", False, str(e)[:30]))
+
+    # MLX90640
+    try:
+        import smbus2
+        bus = smbus2.SMBus(BMP280_I2C_BUS)
+        bus.read_byte(MLX90640_I2C_ADDR)
+        bus.close()
+        checks.append(("MLX90640", True, "0x33"))
+    except Exception as e:
+        checks.append(("MLX90640", False, str(e)[:30]))
+
+    # Ollama
+    try:
+        r = subprocess.run(["systemctl", "is-active", "ollama"],
+                           capture_output=True, text=True)
+        active = r.stdout.strip() == "active"
+        checks.append(("Ollama", active, "active" if active else "inactive"))
+    except Exception:
+        checks.append(("Ollama", False, "unknown"))
+
+    # Snowflake
+    try:
+        import snowflake.connector
+        conn = snowflake.connector.connect(
+            connection_name=SNOWFLAKE_CONNECTION,
+            database=DATABASE, schema=SCHEMA, warehouse=WAREHOUSE,
+        )
+        conn.cursor().execute("SELECT 1")
+        conn.close()
+        checks.append(("Snowflake", True, "connected"))
+    except Exception as e:
+        checks.append(("Snowflake", False, str(e)[:30]))
+
+    text = Text()
+    for name, ok, detail in checks:
+        mark = "[green]✓[/green]" if ok else "[red]✗[/red]"
+        text.append_text(Text.from_markup(f" {mark} {name:<10} {detail}\n"))
+
+    return Panel(text, title="[bold yellow]System Health[/bold yellow]", border_style="yellow")
+
+
+def _dashboard_llm(conn):
+    """Build an LLM performance metrics panel."""
+    from rich.panel import Panel
+    from rich.table import Table
+
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT MODEL_NAME, COUNT(*) AS RUNS,
+               AVG(DURATION_S) AS AVG_DUR,
+               AVG(TOKENS) AS AVG_TOKENS,
+               SUM(CASE WHEN STATUS='success' THEN 1 ELSE 0 END) AS OK,
+               SUM(CASE WHEN STATUS!='success' THEN 1 ELSE 0 END) AS FAIL
+        FROM {DATABASE}.{SCHEMA}.{LLM_RESULTS_TABLE}
+        GROUP BY MODEL_NAME
+        ORDER BY RUNS DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+
+    table = Table(show_header=True, header_style="bold blue", expand=True)
+    table.add_column("Model", width=14)
+    table.add_column("Runs", width=5, justify="right")
+    table.add_column("Avg(s)", width=7, justify="right")
+    table.add_column("Tokens", width=7, justify="right")
+    table.add_column("OK", width=4, justify="right", style="green")
+    table.add_column("Fail", width=4, justify="right", style="red")
+
+    for row in rows:
+        model = (row[0] or "")[:13]
+        runs = str(row[1])
+        avg_dur = f"{row[2]:.1f}" if row[2] else "-"
+        avg_tok = f"{row[3]:.0f}" if row[3] else "-"
+        ok = str(row[4])
+        fail = str(row[5])
+        table.add_row(model, runs, avg_dur, avg_tok, ok, fail)
+
+    if not rows:
+        table.add_row("(no data)", "-", "-", "-", "-", "-")
+
+    return Panel(table, title="[bold blue]LLM Performance[/bold blue]", border_style="blue")
+
+
+def cmd_dashboard(args):
+    """Render a Rich terminal dashboard with analytics and system health."""
+    from rich.console import Console
+    from rich.columns import Columns
+    from rich.text import Text
+
+    console = Console()
+    live_mode = getattr(args, "live", False)
+    compact = getattr(args, "compact", False)
+
+    def render_dashboard():
+        console.clear()
+        header = Text("  BADGE SCANNER DASHBOARD", style="bold white on blue")
+        console.print(header)
+        console.print()
+
+        try:
+            conn = _get_snowflake_conn()
+        except Exception as e:
+            console.print(f"[red]Snowflake connection failed:[/red] {e}")
+            console.print()
+            console.print(_dashboard_health())
+            return
+
+        try:
+            if compact:
+                # Compact: just summary + recent scans
+                console.print(_dashboard_summary(conn))
+                console.print(_dashboard_recent(conn))
+            else:
+                # Full layout: all panels
+                console.print(Columns([_dashboard_summary(conn), _dashboard_sparkline(conn)], equal=True))
+                console.print(_dashboard_recent(conn))
+                console.print(Columns([_dashboard_health(), _dashboard_llm(conn)], equal=True))
+        finally:
+            conn.close()
+
+        from datetime import datetime
+        console.print(f"\n  [dim]Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]")
+
+    if live_mode:
+        import time as _time
+        console.print("[dim]Live mode — refreshing every 30s. Press Ctrl+C to exit.[/dim]\n")
+        try:
+            while True:
+                render_dashboard()
+                _time.sleep(30)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Dashboard stopped.[/dim]")
+    else:
+        render_dashboard()
+
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -488,13 +870,22 @@ def main():
 
     sub.add_parser("start", help="Start the Ollama LLM service")
     sub.add_parser("stop", help="Stop the Ollama LLM service")
-    sub.add_parser("scan", help="Run the full badge scanning pipeline")
+
+    p_scan = sub.add_parser("scan", help="Run the full badge scanning pipeline")
+    p_scan.add_argument("--camera", type=int, default=None,
+                        help="Camera index to use (default: auto-select first USB camera)")
 
     p_list = sub.add_parser("list", help="Show recent scans from Snowflake")
     p_list.add_argument("--limit", type=int, default=10, help="Number of rows (default 10)")
 
     sub.add_parser("test", help="Pre-flight health checks")
     sub.add_parser("validate", help="Static code validation of badge_scanner.py")
+
+    p_dash = sub.add_parser("dashboard", help="Rich terminal dashboard with analytics and metrics")
+    p_dash.add_argument("--live", action="store_true",
+                        help="Auto-refresh every 30s (Ctrl+C to exit)")
+    p_dash.add_argument("--compact", action="store_true",
+                        help="Minimal view for narrow terminals")
 
     args = parser.parse_args()
 
@@ -505,6 +896,7 @@ def main():
         "list": cmd_list,
         "test": cmd_test,
         "validate": cmd_validate,
+        "dashboard": cmd_dashboard,
     }
 
     sys.exit(dispatch[args.command](args))
